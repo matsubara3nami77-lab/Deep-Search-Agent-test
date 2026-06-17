@@ -21,11 +21,10 @@ from app.graph.research_graph import create_research_graph  # noqa: E402
 _graph = create_research_graph()
 
 # ---------------------------------------------------------------------------
-# In-memory execution store
-# Maps execution_id -> {"thread_id": str, "report": str}
-# Entries are created when the graph pauses for approval and removed on resume.
+# In-memory session store: execution_id -> {"thread_id": str}
+# An entry exists while a research session is paused at an interrupt.
 # ---------------------------------------------------------------------------
-_pending_executions: dict[str, dict[str, Any]] = {}
+_sessions: dict[str, dict[str, Any]] = {}
 
 
 @asynccontextmanager
@@ -33,7 +32,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Deep Research Agent API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Deep Research Agent API", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,29 +44,59 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Request / response models
+# Request models
 # ---------------------------------------------------------------------------
 
 class ResearchRequest(BaseModel):
     query: str
+    mode: str = "todo"  # "todo" | "plan"
 
 
-class ApproveRequest(BaseModel):
+class ContinueRequest(BaseModel):
     execution_id: str
-    approved: bool
+    resume: Any  # bool | str | dict — interpreted by the paused interrupt node
 
 
 # ---------------------------------------------------------------------------
-# SSE helper
+# Plain-text / SSE contract helpers
 # ---------------------------------------------------------------------------
+
+def _as_text(value: object) -> str:
+    """Coerce any value to a plain string for SSE/UI contracts."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        if isinstance(value.get("content"), str):
+            return value["content"]
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        parts = [_as_text(item) for item in value]
+        return "\n".join(part for part in parts if part).strip()
+    return str(value)
+
+
+def _as_text_list(value: object) -> list[str]:
+    """Coerce a value into a list of plain strings."""
+    if isinstance(value, list):
+        return [_as_text(item) for item in value]
+    return []
+
 
 def sse(data: dict) -> str:
-    return f"data: {json.dumps(data)}\n\n"
+    payload = dict(data)
+    for key in ("type", "message", "content", "execution_id", "target"):
+        if key in payload:
+            payload[key] = _as_text(payload[key])
+    if "options" in payload:
+        payload["options"] = _as_text_list(payload["options"])
+    if "plan" in payload:
+        payload["plan"] = _as_text_list(payload["plan"])
+    return f"data: {json.dumps(payload)}\n\n"
 
-
-# ---------------------------------------------------------------------------
-# Error sanitiser – converts raw exception messages into user-friendly text
-# ---------------------------------------------------------------------------
 
 def _friendly_error(exc: Exception) -> str:
     msg = str(exc)
@@ -88,53 +117,53 @@ def _friendly_error(exc: Exception) -> str:
     if "timeout" in msg.lower() or "timed out" in msg.lower():
         return "The request timed out. Please try again."
 
-    # Generic fallback — hide internal details
     return "Something went wrong while processing your request. Please try again."
 
 
 # ---------------------------------------------------------------------------
-# POST /api/research  – run until approval interrupt
+# Shared graph streaming — used by both /api/research and /api/research/continue
 # ---------------------------------------------------------------------------
 
-@app.post("/api/research")
-async def research(request: ResearchRequest):
+async def _stream_graph(execution_id: str, graph_input: Any, mode: str):
     """
-    Stream research progress via SSE.
+    Drive the graph, translating LangGraph chunks into SSE events.
 
-    Events:
-      {"type": "status",            "message": "..."}
-      {"type": "report",            "content": "...markdown..."}
-      {"type": "approval_required", "execution_id": "...", "message": "..."}
-      {"type": "error",             "message": "..."}
+    Stops (returns) at the first interrupt, leaving the session registered so it
+    can be resumed via /api/research/continue. On full completion it emits the
+    final report/status and a `done` event, then removes the session.
     """
+    config = {"configurable": {"thread_id": _sessions[execution_id]["thread_id"]}}
+    current_state: dict = {}
 
-    execution_id = str(uuid.uuid4())
-    thread_id = execution_id          # use same id as LangGraph thread key
-    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        async for chunk in _graph.astream(graph_input, config=config):
+            # --- Interrupt: pause for human input ---
+            if "__interrupt__" in chunk:
+                payload = chunk["__interrupt__"][0].value or {}
+                kind = payload.get("kind")
 
-    async def generate():
-        yield sse({"type": "status", "message": "Searching the web..."})
-
-        current_state: dict = {}
-
-        try:
-            async for chunk in _graph.astream(
-                {"query": request.query},
-                config=config,
-            ):
-                # LangGraph emits {"__interrupt__": [...]} when paused
-                if "__interrupt__" in chunk:
-                    report = current_state.get("report", "")
-                    _pending_executions[execution_id] = {
-                        "thread_id": thread_id,
-                        "report": report,
-                    }
+                if kind == "clarification":
                     yield sse(
                         {
-                            "type": "report",
-                            "content": report,
+                            "type": "clarification_required",
+                            "execution_id": execution_id,
+                            "message": payload.get("question", ""),
+                            "options": payload.get("options", []),
                         }
                     )
+                elif kind == "plan_review":
+                    yield sse(
+                        {
+                            "type": "plan_review",
+                            "execution_id": execution_id,
+                            "plan": payload.get("plan", []),
+                        }
+                    )
+                elif kind == "approval":
+                    yield sse({"type": "report", "content": _as_text(current_state.get("report", ""))})
+                    if mode == "plan":
+                        total = len(current_state.get("plan", [])) or 4
+                        yield sse({"type": "plan_progress", "completed": total, "total": total})
                     yield sse(
                         {
                             "type": "approval_required",
@@ -142,32 +171,61 @@ async def research(request: ResearchRequest):
                             "message": "Report generated. Do you want to save it to disk?",
                         }
                     )
-                    return
+                return
 
-                for node_name, node_output in chunk.items():
-                    current_state.update(node_output)
+            # --- Normal node outputs: emit status / progress ---
+            for node_name, node_output in chunk.items():
+                if node_name.startswith("__") or not isinstance(node_output, dict):
+                    continue
+                current_state.update(node_output)
 
-                    if node_name == "search":
-                        count = len(current_state.get("search_results", []))
-                        yield sse(
-                            {
-                                "type": "status",
-                                "message": f"Found {count} sources. Generating report with Gemini...",
-                            }
-                        )
-                    elif node_name == "generate":
-                        yield sse(
-                            {
-                                "type": "status",
-                                "message": "Report generated. Awaiting your approval to save...",
-                            }
-                        )
+                if node_name == "intent" and current_state.get("intent") == "mode_switch":
+                    yield sse(
+                        {
+                            "type": "mode_switch",
+                            "target": current_state.get("mode_target", "todo"),
+                            "message": current_state.get("chat_answer", ""),
+                        }
+                    )
+                elif node_name == "intent" and current_state.get("intent") == "chat":
+                    yield sse({"type": "chat", "content": current_state.get("chat_answer", "")})
+                elif node_name == "plan":
+                    yield sse({"type": "status", "message": "Plan ready for your review."})
+                elif node_name == "search":
+                    count = len(current_state.get("search_results", []))
+                    yield sse(
+                        {
+                            "type": "status",
+                            "message": f"Found {count} sources. Generating report with Gemini...",
+                        }
+                    )
+                    if mode == "plan":
+                        total = len(current_state.get("plan", [])) or 4
+                        yield sse({"type": "plan_progress", "completed": 2, "total": total})
+                elif node_name == "generate":
+                    yield sse({"type": "status", "message": "Report generated."})
+                    if mode == "plan":
+                        total = len(current_state.get("plan", [])) or 4
+                        yield sse({"type": "plan_progress", "completed": total, "total": total})
 
-        except Exception as exc:
-            yield sse({"type": "error", "message": _friendly_error(exc)})
+        # --- Graph finished (no further interrupt) ---
+        report_path = current_state.get("report_path", "")
+        if report_path:
+            yield sse({"type": "status", "message": f"Report saved to {report_path}"})
+        elif current_state.get("save_approved") is False:
+            yield sse({"type": "status", "message": "Save skipped."})
 
+        yield sse({"type": "done"})
+        _sessions.pop(execution_id, None)
+
+    except Exception as exc:
+        _sessions.pop(execution_id, None)
+        yield sse({"type": "error", "message": _friendly_error(exc)})
+
+
+def _stream_response(generator) -> StreamingResponse:
     return StreamingResponse(
-        generate(),
+        generator,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -178,47 +236,43 @@ async def research(request: ResearchRequest):
 
 
 # ---------------------------------------------------------------------------
-# POST /api/research/approve  – resume graph with user decision
+# POST /api/research — start a new research session
 # ---------------------------------------------------------------------------
 
-@app.post("/api/research/approve")
-async def approve_research(request: ApproveRequest):
-    """
-    Resume a paused research execution.
+@app.post("/api/research")
+async def research(request: ResearchRequest):
+    execution_id = str(uuid.uuid4())
+    _sessions[execution_id] = {"thread_id": execution_id}
 
-    Request:  {"execution_id": "...", "approved": true|false}
-    Response: {"status": "saved"|"skipped", "report_path": "..."}
-    """
-    execution = _pending_executions.pop(request.execution_id, None)
-    if execution is None:
+    mode = request.mode if request.mode in ("todo", "plan") else "todo"
+    graph_input = {"query": request.query, "mode": mode, "current_step": 0}
+
+    return _stream_response(_stream_graph(execution_id, graph_input, mode))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/research/continue — resume a paused session
+# Used for: clarification answer, plan start, plan regeneration, save approval
+# ---------------------------------------------------------------------------
+
+@app.post("/api/research/continue")
+async def continue_research(request: ContinueRequest):
+    session = _sessions.get(request.execution_id)
+    if session is None:
         raise HTTPException(status_code=404, detail="Execution not found or already resolved.")
 
-    thread_id: str = execution["thread_id"]
-    config = {"configurable": {"thread_id": thread_id}}
-
-    # Resume the graph by sending the human's decision as the interrupt resume value.
-    # Command(resume=value) is LangGraph's API for continuing a paused graph;
-    # passing a plain dict would restart from the beginning instead of resuming.
-    final_state: dict = {}
+    # Recover the mode from the checkpointed state so progress events stay correct.
+    config = {"configurable": {"thread_id": session["thread_id"]}}
+    mode = "todo"
     try:
-        async for chunk in _graph.astream(
-            Command(resume=request.approved),
-            config=config,
-        ):
-            # Skip __interrupt__ and other non-node chunks
-            for node_name, node_output in chunk.items():
-                if node_name.startswith("__"):
-                    continue
-                if isinstance(node_output, dict):
-                    final_state.update(node_output)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=_friendly_error(exc)) from exc
+        snapshot = _graph.get_state(config)
+        mode = (snapshot.values.get("mode") if snapshot and snapshot.values else "todo") or "todo"
+    except Exception:
+        mode = "todo"
 
-    if request.approved:
-        report_path = final_state.get("report_path", "")
-        return {"status": "saved", "report_path": report_path}
-    else:
-        return {"status": "skipped", "report_path": ""}
+    return _stream_response(
+        _stream_graph(request.execution_id, Command(resume=request.resume), mode)
+    )
 
 
 # ---------------------------------------------------------------------------
