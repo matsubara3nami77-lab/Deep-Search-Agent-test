@@ -1,13 +1,13 @@
 # Deep Research Agent — Level 1
 
-An AI-powered deep research web application. Enter a topic, and the agent searches the web with Tavily, generates a comprehensive report with Gemini 2.5 Flash Lite, saves it to disk, and streams everything live to the UI.
+An AI-powered deep research web application. Enter a topic, and the agent searches the web with Tavily, generates a comprehensive report with Gemini 3.1 Flash Lite, saves it to disk, and streams everything live to the UI.
 
 ## Architecture
 
 ```
 User Query
   → LangGraph: search node  (Tavily web search)
-  → LangGraph: generate node (Gemini 2.5 Flash Lite)
+  → LangGraph: generate node (Gemini 3.1 Flash Lite)
   → LangGraph: save node     (writes data/reports/report_<timestamp>.md)
   → SSE stream → Next.js frontend
 ```
@@ -18,7 +18,7 @@ User Query
 | --------- | --------------------------------------- |
 | Frontend  | Next.js 15 (App Router), TypeScript, Tailwind CSS |
 | Backend   | Python, FastAPI, LangGraph              |
-| LLM       | Gemini 2.5 Flash Lite (via LangChain)   |
+| LLM       | Gemini 3.1 Flash Lite (via LangChain)   |
 | Search    | Tavily                                  |
 
 ## Project Structure
