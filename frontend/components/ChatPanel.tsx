@@ -2,7 +2,8 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import type { Message, Phase } from "@/app/page";
-import type { Mode } from "@/lib/api";
+import type { Mode, SynthesisStatus, Task } from "@/lib/api";
+import AgentActivity from "@/components/AgentActivity";
 import ClarificationCard from "@/components/ClarificationCard";
 import ModeToggle from "@/components/ModeToggle";
 import PlanViewer from "@/components/PlanViewer";
@@ -16,7 +17,9 @@ interface ChatPanelProps {
   phase: Phase;
   plan: string[] | null;
   planAwaitingReview: boolean;
-  planCompleted: number;
+  tasks: Task[];
+  completedTaskIds: number[];
+  synthesisStatus: SynthesisStatus | null;
   onPlanStart: () => void;
   onPlanRegenerate: (instruction: string) => void;
   pendingApproval: boolean;
@@ -229,7 +232,9 @@ export default function ChatPanel({
   phase,
   plan,
   planAwaitingReview,
-  planCompleted,
+  tasks,
+  completedTaskIds,
+  synthesisStatus,
   onPlanStart,
   onPlanRegenerate,
   pendingApproval,
@@ -242,7 +247,7 @@ export default function ChatPanel({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, plan, planCompleted, pendingApproval, clarification]);
+  }, [messages, plan, completedTaskIds, synthesisStatus, pendingApproval, clarification]);
 
   const inputDisabled =
     isStreaming || planAwaitingReview || pendingApproval || !!clarification;
@@ -255,7 +260,11 @@ export default function ChatPanel({
   };
 
   const showEmptyState =
-    messages.length === 0 && !plan && !pendingApproval && !clarification;
+    messages.length === 0 &&
+    !plan &&
+    tasks.length === 0 &&
+    !pendingApproval &&
+    !clarification;
 
   return (
     <div className="flex flex-col h-full">
@@ -331,14 +340,24 @@ export default function ChatPanel({
           <MessageBubble key={msg.id} message={msg} />
         ))}
 
-        {plan && (
+        {plan && planAwaitingReview && (
           <PlanViewer
             plan={plan}
             awaitingReview={planAwaitingReview}
-            completed={planCompleted}
+            completed={0}
             isBusy={isStreaming}
             onStart={onPlanStart}
             onRegenerate={onPlanRegenerate}
+          />
+        )}
+
+        {tasks.length > 0 && !planAwaitingReview && (
+          <AgentActivity
+            tasks={tasks}
+            completedTaskIds={completedTaskIds}
+            synthesisStatus={synthesisStatus}
+            isStreaming={isStreaming}
+            pendingApproval={pendingApproval}
           />
         )}
 

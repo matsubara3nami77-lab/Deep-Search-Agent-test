@@ -132,8 +132,22 @@ async def _stream_graph(execution_id: str, graph_input: Any, mode: str):
     can be resumed via /api/research/continue. On full completion it emits the
     final report/status and a `done` event, then removes the session.
     """
-    config = {"configurable": {"thread_id": _sessions[execution_id]["thread_id"]}}
+    config = {
+        "configurable": {"thread_id": _sessions[execution_id]["thread_id"]},
+        # Cap parallel worker fan-out to avoid hitting LLM/search rate limits.
+        "max_concurrency": 4,
+    }
     current_state: dict = {}
+    workers_done = 0
+
+    # Seed from any existing checkpoint so resumed streams know the task list even
+    # though the supervisor node does not re-run (e.g. plan-mode "start").
+    try:
+        seed = _graph.get_state(config)
+        if seed and seed.values:
+            current_state.update(seed.values)
+    except Exception:
+        pass
 
     try:
         async for chunk in _graph.astream(graph_input, config=config):
@@ -161,9 +175,6 @@ async def _stream_graph(execution_id: str, graph_input: Any, mode: str):
                     )
                 elif kind == "approval":
                     yield sse({"type": "report", "content": _as_text(current_state.get("report", ""))})
-                    if mode == "plan":
-                        total = len(current_state.get("plan", [])) or 4
-                        yield sse({"type": "plan_progress", "completed": total, "total": total})
                     yield sse(
                         {
                             "type": "approval_required",
@@ -189,24 +200,52 @@ async def _stream_graph(execution_id: str, graph_input: Any, mode: str):
                     )
                 elif node_name == "intent" and current_state.get("intent") == "chat":
                     yield sse({"type": "chat", "content": current_state.get("chat_answer", "")})
-                elif node_name == "plan":
-                    yield sse({"type": "status", "message": "Plan ready for your review."})
-                elif node_name == "search":
-                    count = len(current_state.get("search_results", []))
+                elif node_name == "supervisor":
+                    tasks = current_state.get("tasks", [])
+                    yield sse(
+                        {
+                            "type": "tasks",
+                            "execution_id": execution_id,
+                            "tasks": [
+                                {"id": t.get("id"), "title": t.get("title", "")}
+                                for t in tasks
+                            ],
+                        }
+                    )
                     yield sse(
                         {
                             "type": "status",
-                            "message": f"Found {count} sources. Generating report with Gemini...",
+                            "message": f"Supervisor decomposed the topic into {len(tasks)} research tasks.",
                         }
                     )
-                    if mode == "plan":
-                        total = len(current_state.get("plan", [])) or 4
-                        yield sse({"type": "plan_progress", "completed": 2, "total": total})
-                elif node_name == "generate":
+                elif node_name == "worker":
+                    findings = node_output.get("findings") or []
+                    for finding in findings:
+                        if isinstance(finding, dict):
+                            yield sse(
+                                {
+                                    "type": "task_progress",
+                                    "task_id": finding.get("task_id"),
+                                    "status": "completed",
+                                }
+                            )
+                            workers_done += 1
+                    total = len(current_state.get("tasks", []))
+                    if total and workers_done >= total:
+                        yield sse({"type": "synthesis", "status": "running"})
+                        yield sse(
+                            {
+                                "type": "status",
+                                "message": "All workers finished. Synthesizing findings...",
+                            }
+                        )
+                elif node_name == "synthesis":
+                    yield sse({"type": "synthesis", "status": "completed"})
+                    yield sse(
+                        {"type": "status", "message": "Synthesis complete. Generating report..."}
+                    )
+                elif node_name == "report":
                     yield sse({"type": "status", "message": "Report generated."})
-                    if mode == "plan":
-                        total = len(current_state.get("plan", [])) or 4
-                        yield sse({"type": "plan_progress", "completed": total, "total": total})
 
         # --- Graph finished (no further interrupt) ---
         report_path = current_state.get("report_path", "")

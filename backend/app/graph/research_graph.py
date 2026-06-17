@@ -1,15 +1,17 @@
-from typing import Optional, TypedDict
+import operator
+from typing import Annotated, Optional, TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Send, interrupt
 
 from app.services.clarification_service import detect_clarification
 from app.services.gemini_service import generate_report
 from app.services.intent_service import classify_intent
-from app.services.plan_service import generate_plan
+from app.services.supervisor_service import decompose
+from app.services.synthesis_service import synthesize
+from app.services.worker_service import run_task
 from app.tools.save_report_tool import save_report
-from app.tools.search_tool import search_web
 
 
 class ResearchState(TypedDict, total=False):
@@ -19,12 +21,18 @@ class ResearchState(TypedDict, total=False):
     chat_answer: str
     mode_target: str
     refined_query: str
-    search_results: list[dict]
+    # --- Level 4 multi-agent fields ---
+    tasks: list[dict]  # Supervisor decomposition: [{"id", "title", "query"}]
+    findings: Annotated[list[dict], operator.add]  # fan-in accumulator (parallel workers)
+    synthesis: str  # integrated synthesis from the Synthesis agent
+    # --- Report + persistence ---
     report: str
     report_path: str
     save_approved: bool
+    # --- Plan-mode review (reuses task titles) ---
     plan: list[str]
     edit_instruction: Optional[str]
+    # --- Clarification ---
     needs_clarification: bool
     clarification: dict
     current_step: int
@@ -79,24 +87,29 @@ async def clarification_node(state: ResearchState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Plan mode (regeneration-based editing)
+# Supervisor — dynamic task decomposition (no hardcoded roles)
 # ---------------------------------------------------------------------------
 
-async def plan_node(state: ResearchState) -> dict:
+async def supervisor_node(state: ResearchState) -> dict:
     query = state.get("refined_query") or state["query"]
-    plan = await generate_plan(
+    tasks = await decompose(
         query,
         edit_instruction=state.get("edit_instruction"),
-        previous_plan=state.get("plan"),
+        previous_tasks=state.get("tasks"),
     )
-    return {"plan": plan, "edit_instruction": None}
+    return {
+        "tasks": tasks,
+        "plan": [t["title"] for t in tasks],
+        "edit_instruction": None,
+        "current_step": 1,
+    }
 
 
-async def plan_review_node(state: ResearchState) -> dict:
+async def task_review_node(state: ResearchState) -> dict:
     """
-    Pause to show the plan. Resume value is either:
-      {"action": "start"}                        -> begin execution
-      {"action": "edit", "instruction": "..."}   -> regenerate plan
+    Plan-mode pause: show the decomposed tasks for review. Resume value is either:
+      {"action": "start"}                        -> begin parallel execution
+      {"action": "edit", "instruction": "..."}   -> re-run the Supervisor
     """
     decision = interrupt({"kind": "plan_review", "plan": state["plan"]})
     if isinstance(decision, dict) and decision.get("action") == "edit":
@@ -105,20 +118,38 @@ async def plan_review_node(state: ResearchState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Execution pipeline (shared by both modes)
+# Research Worker — stateless, identical units executed in parallel via Send
 # ---------------------------------------------------------------------------
 
-async def search_node(state: ResearchState) -> dict:
-    query = state.get("refined_query") or state["query"]
-    results = await search_web(query)
-    return {"search_results": results, "current_step": 2}
+async def worker_node(state: ResearchState) -> dict:
+    task = state["task"]  # injected per-Send payload
+    finding = await run_task(task)
+    return {"findings": [finding]}
 
 
-async def generate_node(state: ResearchState) -> dict:
+# ---------------------------------------------------------------------------
+# Synthesis — merge all worker findings into a coherent whole (fan-in)
+# ---------------------------------------------------------------------------
+
+async def synthesis_node(state: ResearchState) -> dict:
     query = state.get("refined_query") or state["query"]
-    report = await generate_report(query, state["search_results"])
+    synthesis = await synthesize(query, state.get("findings", []))
+    return {"synthesis": synthesis, "current_step": 2}
+
+
+# ---------------------------------------------------------------------------
+# Report — turn the synthesis into a user-facing markdown document
+# ---------------------------------------------------------------------------
+
+async def report_node(state: ResearchState) -> dict:
+    query = state.get("refined_query") or state["query"]
+    report = await generate_report(query, state.get("synthesis", ""))
     return {"report": report, "current_step": 4}
 
+
+# ---------------------------------------------------------------------------
+# HITL approval + save (Level 2, unchanged)
+# ---------------------------------------------------------------------------
 
 async def approval_node(state: ResearchState) -> dict:
     """Level 2 HITL: pause before saving. Resume value is a bool."""
@@ -137,6 +168,11 @@ async def save_node(state: ResearchState) -> dict:
 # Routers
 # ---------------------------------------------------------------------------
 
+def _fan_out(state: ResearchState) -> list[Send]:
+    """Fan out: one parallel worker per decomposed task."""
+    return [Send("worker", {"task": task}) for task in state.get("tasks", [])]
+
+
 def _route_after_intent(state: ResearchState) -> str:
     if state.get("intent") in ("chat", "mode_switch"):
         return END
@@ -146,16 +182,21 @@ def _route_after_intent(state: ResearchState) -> str:
 def _route_after_clarify_check(state: ResearchState) -> str:
     if state.get("needs_clarification"):
         return "clarification"
-    return "plan" if state.get("mode") == "plan" else "search"
+    return "supervisor"
 
 
-def _route_after_clarification(state: ResearchState) -> str:
-    return "plan" if state.get("mode") == "plan" else "search"
+def _route_after_supervisor(state: ResearchState):
+    # Plan mode pauses for review; todo mode fans out immediately.
+    if state.get("mode") == "plan":
+        return "task_review"
+    return _fan_out(state)
 
 
-def _route_after_plan_review(state: ResearchState) -> str:
-    # If the user asked to edit, loop back and regenerate the plan.
-    return "plan" if state.get("edit_instruction") else "search"
+def _route_after_task_review(state: ResearchState):
+    # If the user asked to edit, loop back and re-decompose.
+    if state.get("edit_instruction"):
+        return "supervisor"
+    return _fan_out(state)
 
 
 def _route_after_approval(state: ResearchState) -> str:
@@ -163,34 +204,37 @@ def _route_after_approval(state: ResearchState) -> str:
 
 
 def create_research_graph():
-    """Build and compile the Level 3 research graph (todo/plan + clarification + HITL)."""
+    """Build and compile the Level 4 multi-agent research graph."""
     checkpointer = MemorySaver()
     workflow: StateGraph = StateGraph(ResearchState)
 
     workflow.add_node("intent", intent_node)
     workflow.add_node("clarify_check", clarify_check_node)
     workflow.add_node("clarification", clarification_node)
-    workflow.add_node("plan", plan_node)
-    workflow.add_node("plan_review", plan_review_node)
-    workflow.add_node("search", search_node)
-    workflow.add_node("generate", generate_node)
+    workflow.add_node("supervisor", supervisor_node)
+    workflow.add_node("task_review", task_review_node)
+    workflow.add_node("worker", worker_node)
+    workflow.add_node("synthesis", synthesis_node)
+    workflow.add_node("report", report_node)
     workflow.add_node("approval", approval_node)
     workflow.add_node("save", save_node)
 
     workflow.add_edge(START, "intent")
     workflow.add_conditional_edges("intent", _route_after_intent, ["clarify_check", END])
     workflow.add_conditional_edges(
-        "clarify_check", _route_after_clarify_check, ["clarification", "plan", "search"]
+        "clarify_check", _route_after_clarify_check, ["clarification", "supervisor"]
+    )
+    workflow.add_edge("clarification", "supervisor")
+    workflow.add_conditional_edges(
+        "supervisor", _route_after_supervisor, ["task_review", "worker"]
     )
     workflow.add_conditional_edges(
-        "clarification", _route_after_clarification, ["plan", "search"]
+        "task_review", _route_after_task_review, ["supervisor", "worker"]
     )
-    workflow.add_edge("plan", "plan_review")
-    workflow.add_conditional_edges(
-        "plan_review", _route_after_plan_review, ["plan", "search"]
-    )
-    workflow.add_edge("search", "generate")
-    workflow.add_edge("generate", "approval")
+    # Fan-in: synthesis runs once after all parallel workers in the superstep finish.
+    workflow.add_edge("worker", "synthesis")
+    workflow.add_edge("synthesis", "report")
+    workflow.add_edge("report", "approval")
     workflow.add_conditional_edges("approval", _route_after_approval, ["save", END])
     workflow.add_edge("save", END)
 

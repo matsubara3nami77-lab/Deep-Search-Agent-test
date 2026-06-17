@@ -46,8 +46,12 @@ def _normalise_llm_content(content: object) -> str:
     stop=stop_after_attempt(4),
     reraise=True,
 )
-async def generate_report(query: str, search_results: list[dict]) -> str:
-    """Generate a structured research report using Gemini 3.1 Flash Lite."""
+async def generate_report(query: str, synthesis: str) -> str:
+    """Generate a structured research report from an integrated synthesis.
+
+    In the Level 4 multi-agent architecture the report is produced from the
+    Synthesis agent's integrated output rather than from raw search results.
+    """
     llm = ChatGoogleGenerativeAI(
         model="gemini-3.1-flash-lite",
         google_api_key=os.environ.get("GEMINI_API_KEY"),
@@ -55,24 +59,13 @@ async def generate_report(query: str, search_results: list[dict]) -> str:
         max_retries=2,
     )
 
-    context_parts: list[str] = []
-    for i, result in enumerate(search_results, 1):
-        title = result.get("title", "Untitled")
-        url = result.get("url", "")
-        content = result.get("content", "")
-        context_parts.append(f"**[{i}] {title}**\nURL: {url}\n\n{content}")
+    context = synthesis.strip() if synthesis and synthesis.strip() else "No synthesis was produced."
 
-    context = (
-        "\n\n---\n\n".join(context_parts)
-        if context_parts
-        else "No search results were found."
-    )
-
-    prompt = f"""You are an expert research analyst. Create a comprehensive, well-structured research report based on the following web search results.
+    prompt = f"""You are an expert research analyst. Create a comprehensive, well-structured research report based on the following integrated research synthesis.
 
 Research Topic: {query}
 
-Web Search Results:
+Research Synthesis:
 {context}
 
 Write a professional research report in Markdown format. Structure it with:

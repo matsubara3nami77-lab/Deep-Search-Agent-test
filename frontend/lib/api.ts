@@ -1,13 +1,18 @@
 export type Mode = "todo" | "plan";
 
+export type Task = { id: number; title: string };
+export type SynthesisStatus = "running" | "completed";
+
 /**
  * Callbacks for SSE events emitted by the backend research stream.
  *
  * SSE event shapes:
  *   {"type": "status",                "message": "..."}
  *   {"type": "report",                "content": "...markdown..."}
+ *   {"type": "tasks",                 "execution_id": "...", "tasks": [{"id": n, "title": "..."}]}
+ *   {"type": "task_progress",         "task_id": n, "status": "completed"}
+ *   {"type": "synthesis",             "status": "running" | "completed"}
  *   {"type": "plan_review",           "execution_id": "...", "plan": ["..."]}
- *   {"type": "plan_progress",         "completed": n, "total": n}
  *   {"type": "clarification_required","execution_id": "...", "message": "...", "options": ["..."]}
  *   {"type": "approval_required",     "execution_id": "...", "message": "..."}
  *   {"type": "error",                 "message": "..."}
@@ -18,8 +23,10 @@ export type StreamHandlers = {
   onChat?: (message: string) => void;
   onModeSwitch?: (target: Mode, message: string) => void;
   onReport?: (report: string) => void;
+  onTasks?: (executionId: string, tasks: Task[]) => void;
+  onTaskProgress?: (taskId: number, status: "completed") => void;
+  onSynthesis?: (status: SynthesisStatus) => void;
   onPlanReview?: (executionId: string, plan: string[]) => void;
-  onPlanProgress?: (completed: number, total: number) => void;
   onClarification?: (executionId: string, question: string, options: string[]) => void;
   onApproval?: (executionId: string) => void;
   onError?: (error: string) => void;
@@ -32,8 +39,10 @@ type SSEEvent = {
     | "chat"
     | "mode_switch"
     | "report"
+    | "tasks"
+    | "task_progress"
+    | "synthesis"
     | "plan_review"
-    | "plan_progress"
     | "clarification_required"
     | "approval_required"
     | "error"
@@ -44,8 +53,9 @@ type SSEEvent = {
   target?: Mode;
   plan?: string[];
   options?: string[];
-  completed?: number;
-  total?: number;
+  tasks?: Task[];
+  task_id?: number;
+  status?: SynthesisStatus;
 };
 
 async function consumeStream(response: Response, handlers: StreamHandlers): Promise<void> {
@@ -88,12 +98,20 @@ async function consumeStream(response: Response, handlers: StreamHandlers): Prom
             case "report":
               if (typeof data.content === "string") handlers.onReport?.(data.content);
               break;
+            case "tasks":
+              if (data.execution_id)
+                handlers.onTasks?.(data.execution_id, data.tasks ?? []);
+              break;
+            case "task_progress":
+              if (typeof data.task_id === "number")
+                handlers.onTaskProgress?.(data.task_id, "completed");
+              break;
+            case "synthesis":
+              if (data.status) handlers.onSynthesis?.(data.status);
+              break;
             case "plan_review":
               if (data.execution_id)
                 handlers.onPlanReview?.(data.execution_id, data.plan ?? []);
-              break;
-            case "plan_progress":
-              handlers.onPlanProgress?.(data.completed ?? 0, data.total ?? 0);
               break;
             case "clarification_required":
               if (data.execution_id)

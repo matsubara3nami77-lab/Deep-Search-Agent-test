@@ -8,6 +8,8 @@ import {
   streamResearch,
   type Mode,
   type StreamHandlers,
+  type SynthesisStatus,
+  type Task,
 } from "@/lib/api";
 
 export type Message = {
@@ -38,10 +40,14 @@ export default function Home() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [executionId, setExecutionId] = useState<string | null>(null);
 
-  // Plan mode state
+  // Plan mode state (review of the Supervisor's decomposed tasks)
   const [plan, setPlan] = useState<string[] | null>(null);
   const [planAwaitingReview, setPlanAwaitingReview] = useState(false);
-  const [planCompleted, setPlanCompleted] = useState(0);
+
+  // Multi-agent execution state
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [completedTaskIds, setCompletedTaskIds] = useState<number[]>([]);
+  const [synthesisStatus, setSynthesisStatus] = useState<SynthesisStatus | null>(null);
 
   // Clarification state (independent of plan mode)
   const [clarification, setClarification] = useState<Clarification | null>(null);
@@ -83,13 +89,22 @@ export default function Home() {
         addMessage("agent", m || `Switched to ${target.toUpperCase()} mode.`);
       },
       onReport: (r) => setReport(r),
+      onTasks: (execId, t) => {
+        setExecutionId(execId);
+        setTasks(t);
+        setCompletedTaskIds([]);
+        setSynthesisStatus(null);
+      },
+      onTaskProgress: (taskId) =>
+        setCompletedTaskIds((prev) =>
+          prev.includes(taskId) ? prev : [...prev, taskId],
+        ),
+      onSynthesis: (status) => setSynthesisStatus(status),
       onPlanReview: (execId, p) => {
         setExecutionId(execId);
         setPlan(p);
-        setPlanCompleted(0);
         setPlanAwaitingReview(true);
       },
-      onPlanProgress: (completed) => setPlanCompleted(completed),
       onClarification: (execId, question, options) => {
         setExecutionId(execId);
         setClarification({ question, options });
@@ -140,7 +155,9 @@ export default function Home() {
       setReport("");
       setPlan(null);
       setPlanAwaitingReview(false);
-      setPlanCompleted(0);
+      setTasks([]);
+      setCompletedTaskIds([]);
+      setSynthesisStatus(null);
       setPendingApproval(false);
       setClarification(null);
       addMessage("user", query);
@@ -187,8 +204,7 @@ export default function Home() {
   // --- Plan: start execution ---
   const handlePlanStart = useCallback(async () => {
     setPlanAwaitingReview(false);
-    setPlanCompleted(1);
-    addMessage("agent", "Starting plan execution...");
+    addMessage("agent", "Starting parallel research execution...");
     await resume({ action: "start" });
   }, [resume, addMessage]);
 
@@ -285,7 +301,9 @@ export default function Home() {
           phase={phase}
           plan={plan}
           planAwaitingReview={planAwaitingReview}
-          planCompleted={planCompleted}
+          tasks={tasks}
+          completedTaskIds={completedTaskIds}
+          synthesisStatus={synthesisStatus}
           onPlanStart={handlePlanStart}
           onPlanRegenerate={handlePlanRegenerate}
           pendingApproval={pendingApproval}

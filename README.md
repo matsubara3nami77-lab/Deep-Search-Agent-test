@@ -1,68 +1,116 @@
-# Deep Research Agent — Level 3
+# Deep Research Agent — Level 4 (Multi-Agent)
 
-An AI-powered deep research web application. Enter a topic and the agent searches the web with Tavily, generates a comprehensive report with Gemini 3.1 Flash Lite, and streams everything live to the UI — with human-in-the-loop checkpoints, a plan-first mode, and automatic query clarification built in.
+An AI-powered deep research web application. Enter a topic and the agent decomposes it into independent research tasks, runs them in parallel across stateless worker agents, synthesizes the findings, generates a comprehensive Markdown report with Gemini, and (after your approval) saves it to disk — streaming every step live to the UI.
 
-## Feature Levels
-
-This project was built incrementally across three levels:
-
-| Level | Feature added |
-| ----- | ------------- |
-| **Level 1** | Core pipeline: search → generate → save, SSE streaming to frontend |
-| **Level 2** | Human-in-the-loop (HITL) approval before saving the report to disk |
-| **Level 3** | Plan mode, query clarification, intent classification, mode management |
+The system was built incrementally across four levels. This README is organized so you can see **which feature belongs to which level** and **which files implement it**.
 
 ---
 
-## Architecture
+## Feature levels at a glance
 
-### Level 1 — Core Pipeline
+| Level | Theme | What it adds | Key files |
+| ----- | ----- | ------------ | --------- |
+| **Level 1** | Core pipeline | Web search → report generation → save, streamed over SSE | `tools/search_tool.py`, `services/gemini_service.py`, `tools/save_report_tool.py`, `main.py` |
+| **Level 2** | Human-in-the-loop | Approval checkpoint **before** the report is written to disk | `approval_node`/`save_node` in `graph/research_graph.py`, `ApprovalCard` in `ChatPanel.tsx` |
+| **Level 3** | Modes + clarification | Todo/Plan modes, intent classification, ambiguous-query clarification | `services/intent_service.py`, `services/clarification_service.py`, `ModeToggle.tsx`, `ClarificationCard.tsx`, `PlanViewer.tsx` |
+| **Level 4** | Multi-agent | Supervisor decomposition → parallel workers → synthesis (fan-out/fan-in) | `services/supervisor_service.py`, `services/worker_service.py`, `services/synthesis_service.py`, `AgentActivity.tsx` |
+
+---
+
+## Architecture (Level 4)
+
+```mermaid
+flowchart TD
+  start([START]) --> intent["intent (L3)"]
+  intent -->|chat / mode_switch| done1([END])
+  intent -->|research| clarifyCheck["clarify_check (L3)"]
+  clarifyCheck -->|ambiguous| clarification["clarification interrupt (L3)"]
+  clarifyCheck -->|clear| supervisor
+  clarification --> supervisor
+  supervisor["Supervisor: decompose into N tasks (L4)"] -->|plan mode| taskReview["task_review interrupt (L3+L4)"]
+  supervisor -->|todo mode| fan{{"Send(task) x N (L4)"}}
+  taskReview -->|edit| supervisor
+  taskReview -->|start| fan
+  fan --> workerA["Worker (L4)"]
+  fan --> workerB["Worker (L4)"]
+  fan --> workerC["Worker (L4)"]
+  workerA --> synthesis
+  workerB --> synthesis
+  workerC --> synthesis
+  synthesis["Synthesis: merge findings (L4)"] --> report["Report: Gemini markdown (L1)"]
+  report --> approval["approval interrupt - HITL (L2)"]
+  approval -->|approve| save["save (L1/L2)"]
+  approval -->|reject| done2([END])
+  save --> done3([END])
+```
+
+**Fan-out / fan-in:** the Supervisor emits a list of `Send("worker", {...})` objects, so LangGraph spawns one parallel worker per task. All workers write into a single reducer-backed list (`findings: Annotated[list, operator.add]`); because `worker → synthesis` is a normal edge, `synthesis` runs exactly once after the whole parallel superstep completes.
+
+### How the pipeline evolved
 
 ```
-User Query
-  → LangGraph: intent node     (classify: research / chat / mode_switch)
-  → LangGraph: search node     (Tavily web search)
-  → LangGraph: generate node   (Gemini 3.1 Flash Lite)
-  → SSE stream → Next.js frontend
+Level 1:   search ─────────────► generate ─► save
+Level 2:   search ─► generate ─► [APPROVAL] ─► save
+Level 3:   intent ─► clarify ─► (plan review) ─► search ─► generate ─► [APPROVAL] ─► save
+Level 4:   intent ─► clarify ─► supervisor ─► (task review) ─► ⇶ workers ⇶ ─► synthesis ─► report ─► [APPROVAL] ─► save
+                                                              (parallel)
 ```
 
-### Level 2 — Human-in-the-Loop (HITL)
+---
 
-```
-  ... generate node produces report ...
-  → LangGraph: approval node   (interrupt — waits for user decision)
-      ↓ approved               ↓ rejected
-  → save node                 → END (report shown, not saved)
-    (writes data/reports/report_<timestamp>.md)
-```
+## How it works, by level
 
-**Why HITL is placed before the file save step:**
+### Level 1 — Core research pipeline
+- `tools/search_tool.py` — Tavily web search.
+- `services/gemini_service.py` — `generate_report()` turns research context into a structured Markdown report (Gemini 3.1 Flash Lite). *In Level 4 it consumes the Synthesis output instead of raw search results.*
+- `tools/save_report_tool.py` — writes the report to `data/reports/report_<timestamp>.md`.
+- `main.py` — FastAPI app that drives the LangGraph and streams progress as Server-Sent Events (SSE).
 
-LLM outputs may contain hallucinations or low-quality synthesis, and automatic persistence would pollute the data/reports/ directory with unverified artifacts. The approval step ensures only user-validated outputs are stored.
+### Level 2 — Human-in-the-loop (HITL) save approval
+After the report is generated it is shown in the right panel, then the graph **pauses** (`approval_node` interrupt) and asks you to approve or reject saving.
 
-Additionally, it reduces unnecessary I/O and storage overhead by preventing transient or incomplete results from being written to disk during iterative research runs.
+**Why the checkpoint sits before the file save:**
+- LLM reports can contain hallucinations or unverified claims even when the pipeline runs successfully.
+- Auto-saving every output would accumulate low-quality or incorrect artifacts on disk.
+- Gating the save keeps `data/reports/` a curated set of outputs you have explicitly reviewed and accepted.
 
-### Level 3 — Plan Mode, Clarification, Mode Management
+Approve → report is written to disk. Reject → it stays visible for the session but is never persisted. (The UI Download button is separate — it saves to your browser, not the server, and needs no approval.)
 
-```
-User Query
-  → intent node        (research / chat / mode_switch)
-       ↓ research
-  → clarify_check node (is the query ambiguous?)
-       ↓ needs clarification          ↓ clear
-  → clarification node (interrupt)   → [plan or search]
-       ↓ user answers
-  → [plan or search]
+### Level 3 — Modes, intent, and clarification
 
-  Plan mode path:
-  → plan node          (LLM generates 4-step plan)
-  → plan_review node   (interrupt — user can start, edit, or regenerate)
-       ↓ start         ↓ edit instruction
-  → search node        → plan node (regenerate)
+#### Mode management — design decision: *when Plan Mode triggers*
+- Two modes exist: **Todo** (default) and **Plan**. The active mode is chosen by the user, never silently by the model.
+- You switch modes via the **ModeToggle** in the chat header, or with **slash commands**: `/plan`, `/todo`, `/research` (`/research` is an alias for Todo). A bare `/plan` just switches the mode; `/plan <topic>` switches and runs in one step.
+- The mode is persisted in `sessionStorage`, so it survives page refreshes.
+- `services/intent_service.py` also classifies each message as `research`, `chat`, or `mode_switch`. A pure mode-change sentence ("let's plan first") flips the mode via the `mode_switch` event; conversational messages get a friendly `chat` reply without starting research. A concrete topic always classifies as `research`, even if it mentions a mode.
+- **When does Plan Mode actually pause?** Only in Plan Mode does the graph stop for review after decomposition (`task_review` interrupt). Todo Mode never pauses for review — it goes straight to execution. So "Plan vs Todo" reduces to a single question: *do you want to review the plan before work starts?*
 
-  Both modes continue:
-  → generate node → approval node (HITL) → save node → END
-```
+#### Clarification — design decision: *how the dialog is used*
+- `services/clarification_service.py` (`clarify_check_node`) runs **once, up front, for every research query in both modes**, before any decomposition or search.
+- It is **conservative by design**: it only interrupts when the query is genuinely ambiguous, and on any model/parse failure it returns "no clarification needed" so it can never block research.
+- When it does trigger, the graph interrupts and the UI shows a **ClarificationCard** with the question plus 2–4 distinct options. Your answer is appended to the original query as a focus hint (e.g. `"...power grid (focus: technical challenges)"`) and the refined query flows through the rest of the pipeline.
+- Rationale for running it first and independently of mode: disambiguating the topic up front improves both the Supervisor's decomposition and every worker's search, and keeps a single, predictable place for the human to steer scope.
+
+### Level 4 — Multi-agent distributed research
+
+The single research agent is replaced by three cooperating roles:
+
+- **Supervisor** (`services/supervisor_service.py`) — `decompose()` splits **any** query into 3–6 independent, non-overlapping, parallelizable sub-tasks. Decomposition is **fully dynamic**: the prompt forbids fixed domain buckets (no "market / tech / open-source" templates); every task is tailored to the specific topic. It also supports regeneration from a natural-language instruction (used by Plan Mode review).
+- **Research Workers** (`services/worker_service.py`) — identical, **stateless** units. Each `run_task()` sees only its own task, runs a Tavily search, then uses Gemini to extract structured findings. Workers are **not** domain specialists — parallelism is **task-based, not role-based**. A failing worker returns an error-note finding so one failure never aborts the run (graceful degradation).
+- **Synthesis** (`services/synthesis_service.py`) — `synthesize()` merges all worker findings into one coherent, de-duplicated, logically ordered synthesis, which the Level 1 report generator turns into the final document.
+
+**Frontend:** `AgentActivity.tsx` renders the live multi-agent view in the left panel — Supervisor status, a per-worker task list with running/completed indicators, and Synthesis status — driven by the new `tasks`, `task_progress`, and `synthesis` SSE events.
+
+#### Plan Mode: what changed from Level 3 → Level 4, and why
+
+| | Level 3 Plan Mode | Level 4 Plan Mode |
+| --- | --- | --- |
+| What you review | A fixed **4-step procedural pipeline** ("define scope → search → analyze → report"), reworded per topic | The Supervisor's **dynamic task decomposition** — the actual N independent research sub-tasks |
+| Is it meaningful? | The steps were essentially identical every run; editing changed wording, not the work | Editing/regenerating changes the **real units of parallel work** that get dispatched |
+| Execution | Linear single-agent pipeline | Fan-out to parallel workers after approval |
+| Backend | `plan_node` + `plan_service.py` (now removed) | `supervisor_node` + `task_review` interrupt |
+
+**Why it changed:** in Level 4 the consequential planning artifact is the *task decomposition*, because it determines what is actually researched in parallel. A fixed 4-step pipeline plan no longer reflects how the system runs and would always look the same. So Plan Mode was **unified with the Supervisor**: it now shows the decomposed tasks for review, and "Regenerate" re-runs the Supervisor with your instruction. Todo and Plan modes now share the exact same multi-agent pipeline and differ only in whether the decomposition pauses for human review (`task_review`) before fan-out. The old `plan_service.py` was deleted to avoid a redundant, divergent code path.
 
 ---
 
@@ -79,39 +127,44 @@ User Query
 
 ## Project Structure
 
+Each entry is tagged with the level that introduced it.
+
 ```
 deepresearch-agent-test/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py                       # FastAPI app, SSE endpoints, session store
+│   │   ├── main.py                       # FastAPI app, SSE stream, session store        (L1→L4)
 │   │   ├── graph/
-│   │   │   └── research_graph.py         # LangGraph StateGraph (all nodes + routers)
+│   │   │   └── research_graph.py         # LangGraph: all nodes, routers, Send fan-out   (L1→L4)
 │   │   ├── tools/
-│   │   │   ├── search_tool.py            # Tavily web search
-│   │   │   └── save_report_tool.py       # Save markdown report to disk
+│   │   │   ├── search_tool.py            # Tavily web search                             (L1)
+│   │   │   └── save_report_tool.py       # Save markdown report to disk                  (L1)
 │   │   └── services/
-│   │       ├── gemini_service.py         # Gemini report generation
-│   │       ├── intent_service.py         # Classify: research / chat / mode_switch
-│   │       ├── clarification_service.py  # Detect ambiguous queries, generate options
-│   │       └── plan_service.py           # Generate / regenerate 4-step research plan
+│   │       ├── gemini_service.py         # Report generation (from synthesis in L4)      (L1)
+│   │       ├── intent_service.py         # Classify research / chat / mode_switch        (L3)
+│   │       ├── clarification_service.py  # Detect ambiguous queries, build options       (L3)
+│   │       ├── supervisor_service.py     # Dynamic task decomposition                    (L4)
+│   │       ├── worker_service.py         # Stateless worker: search + extract            (L4)
+│   │       └── synthesis_service.py      # Merge worker findings into a synthesis         (L4)
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
 │   ├── app/
 │   │   ├── layout.tsx
-│   │   ├── page.tsx                      # Root state, session orchestration
+│   │   ├── page.tsx                      # Root state + session orchestration            (L1→L4)
 │   │   └── globals.css
 │   ├── components/
-│   │   ├── ChatPanel.tsx                 # Chat messages, status bar, input
-│   │   ├── ReportPanel.tsx               # Markdown report viewer + download
-│   │   ├── PlanViewer.tsx                # Plan steps, start / regenerate controls
-│   │   ├── ClarificationCard.tsx         # Clarification question + option buttons
-│   │   └── ModeToggle.tsx                # TODO / PLAN mode toggle
+│   │   ├── ChatPanel.tsx                 # Chat, status bar, input, ApprovalCard         (L1/L2)
+│   │   ├── ReportPanel.tsx               # Markdown report viewer + download             (L1)
+│   │   ├── ModeToggle.tsx                # Todo / Plan toggle                            (L3)
+│   │   ├── ClarificationCard.tsx         # Clarification question + options              (L3)
+│   │   ├── PlanViewer.tsx                # Review/regenerate the decomposed task list    (L3→L4)
+│   │   └── AgentActivity.tsx             # Live Supervisor / Workers / Synthesis view    (L4)
 │   ├── lib/
-│   │   └── api.ts                        # SSE streaming client, continueResearch
+│   │   └── api.ts                        # SSE streaming client + handlers               (L1→L4)
 │   └── .env.local.example
 ├── data/
-│   └── reports/                          # Approved .md reports saved here
+│   └── reports/                          # Approved .md reports saved here               (L1)
 └── README.md
 ```
 
@@ -180,121 +233,63 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ---
 
-## Modes
-
-### TODO Mode (default)
-
-Research runs immediately after the query is submitted. The pipeline goes straight to web search and report generation, pausing only at the HITL approval step before saving.
-
-### PLAN Mode
-
-A 4-step research plan is generated and shown for review before any search is performed. The user can:
-
-- **Start** — execute the plan as-is
-- **Regenerate** — provide a natural-language instruction (e.g. "focus more on recent developments") and the LLM rewrites the full plan
-
-Switch modes using the toggle in the top-right of the chat panel, or with slash commands:
-
-| Command | Effect |
-| ------- | ------ |
-| `/plan` | Switch to PLAN mode |
-| `/todo` | Switch to TODO mode |
-| `/plan <query>` | Switch to PLAN mode and immediately start research |
-| `/todo <query>` | Switch to TODO mode and immediately start research |
-
-The active mode is persisted in `sessionStorage` and survives page refreshes.
-
----
-
-## Clarification Flow
-
-Before starting any search, the agent checks whether the query is too ambiguous to research reliably. If it is, the graph pauses and presents the user with:
-
-- A clarifying question (e.g. "Which aspect of Python are you asking about?")
-- 2–4 mutually distinct options to choose from
-
-The selected answer is appended to the original query as a focus hint (e.g. `"Python (focus: performance optimisation)"`) and the pipeline continues. If the query is clear, this step is skipped entirely.
-
----
-
-## Human-in-the-Loop (HITL) Approval
-
-After the report is generated and displayed in the right panel, the pipeline **pauses** and asks the user to approve or reject saving it to disk.
-
-**Why this checkpoint exists:**
-
-- LLM outputs may contain hallucinations or unverified claims even when the pipeline succeeds technically
-- Automatically saving every report would accumulate low-quality or incorrect research artifacts
-- Placing approval here keeps `data/reports/` as a curated set of outputs the user has explicitly reviewed and accepted
-
-If the user approves, the report is saved to `data/reports/report_<timestamp>.md`. If rejected, the report remains visible in the UI for the session but is not written to disk.
-
----
-
 ## API
 
-### `POST /api/research`
-
-Starts a new research session. Returns a Server-Sent Events (SSE) stream.
+### `POST /api/research` (L1, extended through L4)
+Starts a new research session and returns an SSE stream.
 
 **Request body:**
 ```json
-{ "query": "AI coding agents in 2026", "mode": "todo" }
+{ "query": "impact of electric vehicles on the power grid", "mode": "todo" }
 ```
-
 `mode` is `"todo"` (default) or `"plan"`.
 
-**SSE event types:**
+### `POST /api/research/continue` (L2/L3)
+Resumes a session paused at an interrupt. The `resume` value is interpreted by whichever node is waiting.
 
-| Event type | Fields | Description |
-| --- | --- | --- |
-| `status` | `message` | Progress update (searching, generating, saving…) |
-| `chat` | `content` | Conversational reply (greetings, capability questions) |
-| `mode_switch` | `target`, `message` | LLM detected a mode-change request |
-| `report` | `content` | Full markdown report (emitted before approval prompt) |
-| `plan_review` | `execution_id`, `plan` | Graph paused — plan ready for user review |
-| `plan_progress` | `completed`, `total` | How many plan steps have been executed |
-| `clarification_required` | `execution_id`, `message`, `options` | Graph paused — query needs disambiguation |
-| `approval_required` | `execution_id`, `message` | Graph paused — waiting for save approval (HITL) |
-| `error` | `message` | User-friendly error description |
-| `done` | — | Session complete |
-
-**Example stream (TODO mode, no clarification):**
-```
-data: {"type": "status",           "message": "Searching the web..."}
-data: {"type": "status",           "message": "Found 5 sources. Generating report with Gemini..."}
-data: {"type": "status",           "message": "Report generated."}
-data: {"type": "report",           "content": "# Report Title\n\n## Executive Summary\n..."}
-data: {"type": "approval_required","execution_id": "abc-123", "message": "Report generated. Do you want to save it to disk?"}
-```
-
-The stream **pauses** here. Resume it with `POST /api/research/continue`.
-
----
-
-### `POST /api/research/continue`
-
-Resumes a paused session. The `resume` value is interpreted by whichever interrupt node is currently waiting.
-
-**Request body:**
 ```json
 { "execution_id": "abc-123", "resume": <value> }
 ```
 
-| Paused at | `resume` value |
-| --- | --- |
-| `clarification_required` | `"<chosen option string>"` |
-| `plan_review` — start | `{ "action": "start" }` |
-| `plan_review` — regenerate | `{ "action": "edit", "instruction": "<natural language instruction>" }` |
-| `approval_required` | `true` (save) or `false` (skip) |
+| Paused at | `resume` value | Level |
+| --- | --- | --- |
+| clarification | `"<chosen option>"` | L3 |
+| task review — start | `{ "action": "start" }` | L4 |
+| task review — regenerate | `{ "action": "edit", "instruction": "<text>" }` | L4 |
+| save approval | `true` (save) / `false` (skip) | L2 |
 
-Returns a new SSE stream that continues from where execution left off.
-
----
-
-### `GET /health`
-
+### `GET /health` (L1)
 Returns `{"status": "ok"}`.
+
+### SSE event types (tagged by level)
+
+| Event | Fields | Level |
+| --- | --- | --- |
+| `status` | `message` | L1 |
+| `report` | `content` | L1 |
+| `done` | — | L1 |
+| `error` | `message` | L1 |
+| `approval_required` | `execution_id`, `message` | L2 |
+| `chat` | `content` | L3 |
+| `mode_switch` | `target`, `message` | L3 |
+| `clarification_required` | `execution_id`, `message`, `options` | L3 |
+| `plan_review` | `execution_id`, `plan` (task titles) | L3→L4 |
+| `tasks` | `execution_id`, `tasks: [{id, title}]` | L4 |
+| `task_progress` | `task_id`, `status` | L4 |
+| `synthesis` | `status` (`running`/`completed`) | L4 |
+
+**Example stream (Todo mode):**
+```
+data: {"type": "tasks", "execution_id": "abc", "tasks": [{"id":1,"title":"..."}, {"id":2,"title":"..."}]}
+data: {"type": "status", "message": "Supervisor decomposed the topic into 4 research tasks."}
+data: {"type": "task_progress", "task_id": 3, "status": "completed"}
+data: {"type": "task_progress", "task_id": 1, "status": "completed"}
+data: {"type": "synthesis", "status": "running"}
+data: {"type": "synthesis", "status": "completed"}
+data: {"type": "report", "content": "# ...markdown..."}
+data: {"type": "approval_required", "execution_id": "abc", "message": "Report generated. Do you want to save it to disk?"}
+```
+(`task_progress` events typically arrive out of task order — that is the parallel workers finishing independently.)
 
 ---
 
@@ -304,5 +299,12 @@ Approved reports are saved as Markdown files in `data/reports/`:
 ```
 data/reports/report_20260617_120000.md
 ```
+You can also download the current report from the UI (browser download, no approval required).
 
-You can also download any report directly from the UI using the Download button in the report panel (no approval required for download — it saves to your browser's downloads, not the server).
+---
+
+## Implementation notes & tradeoffs
+
+- **Concurrency cap:** worker fan-out is capped via `max_concurrency=4` in `main.py` to avoid Gemini/Tavily rate limits; the Supervisor is bounded to 3–6 tasks. Tune both if you hit `RESOURCE_EXHAUSTED`.
+- **Per-task "running" state:** the UI infers "running" from fan-out start (all workers start together) and flips each to "completed" on its `task_progress` event. For exact per-worker start events you could emit a custom LangGraph stream from inside `worker_node`.
+- **Two LLM stages in L4:** synthesis and report are separate Gemini calls for clarity; they could be merged to cut latency/cost.

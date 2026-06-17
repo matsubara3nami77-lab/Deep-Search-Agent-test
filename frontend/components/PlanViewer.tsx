@@ -5,7 +5,7 @@ import { useState } from "react";
 interface PlanViewerProps {
   plan: string[];
   awaitingReview: boolean;
-  completed: number;
+  completed?: number;
   isBusy: boolean;
   onStart: () => void;
   onRegenerate: (instruction: string) => void;
@@ -39,7 +39,7 @@ function StepIcon({ state }: { state: "done" | "running" | "pending" }) {
 export default function PlanViewer({
   plan,
   awaitingReview,
-  completed,
+  completed = 0,
   isBusy,
   onStart,
   onRegenerate,
